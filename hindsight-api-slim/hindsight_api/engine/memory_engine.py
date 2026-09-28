@@ -8613,6 +8613,18 @@ class MemoryEngine(MemoryEngineInterface):
                             logger.warning(f"Post-recall hook error (non-fatal): {hook_err}")
                     raise Exception(error_msg)
 
+            # The SQL-store half of the failure-path re-check above. A bank deleted by another
+            # process within the cache TTL does not FAIL here -- its rows are gone, so the recall
+            # answers empty, indistinguishable from a healthy empty bank. Only an empty SQL recall
+            # can be that, and it has already taken a connection per retrieval arm, so one more
+            # existence read on it is marginal; a recall with results never pays it. A store that
+            # owns its storage fails loudly instead, and is covered by the failure path.
+            if result is not None and not result.results:
+                from .memories import get_memories
+
+                if not get_memories().store_owned_for(bank_id):
+                    await self._raise_if_bank_deleted(bank_id)
+
             # Call post-operation hook for success
             if self._operation_validator and result is not None:
                 from hindsight_api.extensions.operation_validator import RecallResult
@@ -14695,13 +14707,14 @@ class MemoryEngine(MemoryEngineInterface):
             raise OperationValidationError(f"Bank '{bank_id}' not found", status_code=404)
 
     async def _raise_if_bank_deleted(self, bank_id: str) -> None:
-        """After a bank-scoped read FAILED, 404 if the bank no longer exists.
+        """After a bank-scoped read failed or came back empty, 404 if the bank no longer exists.
 
-        The failure-path complement to :meth:`_require_bank_exists`. That guard reads through the
+        The after-the-fact complement to :meth:`_require_bank_exists`. That guard reads through the
         per-process ``bank_info_cache``, and ``delete_bank`` invalidates only the process that
         served it, so for up to the cache TTL another process lets a read of a deleted bank
-        through. The read then fails in the store rather than answering 404. This probe is
-        uncached, and runs only after a failure, so a successful read pays nothing for it.
+        through. The read then fails in a store that owns its storage, or answers empty from the
+        SQL store, rather than answering 404. This probe is uncached, and runs only on those two
+        outcomes, so a read that returns results pays nothing for it.
 
         When the bank is gone the stale entry is dropped, so later reads on this process 404
         at the guard instead of failing in the store again. A probe that itself fails is
