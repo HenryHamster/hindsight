@@ -8542,6 +8542,14 @@ class MemoryEngine(MemoryEngineInterface):
                             )
                             await asyncio.sleep(wait_time)
                         else:
+                            # The existence guard above answers from a per-process cache, so a
+                            # bank deleted by ANOTHER process within the TTL still reads as
+                            # existing here, and the recall then fails in the store (a store that
+                            # owns its storage has already dropped the bank's). Re-check uncached,
+                            # only now that the recall has failed, so the hot path stays free of
+                            # the extra acquire: a bank that is gone answers the 404 the guard
+                            # would have given, not an opaque store error.
+                            await self._raise_if_bank_deleted(bank_id)
                             # Not a connection error or out of retries - call post-hook and raise
                             error_msg = str(e)
                             if self._operation_validator:
@@ -14685,6 +14693,33 @@ class MemoryEngine(MemoryEngineInterface):
             from hindsight_api.extensions import OperationValidationError
 
             raise OperationValidationError(f"Bank '{bank_id}' not found", status_code=404)
+
+    async def _raise_if_bank_deleted(self, bank_id: str) -> None:
+        """After a bank-scoped read FAILED, 404 if the bank no longer exists.
+
+        The failure-path complement to :meth:`_require_bank_exists`. That guard reads through the
+        per-process ``bank_info_cache``, and ``delete_bank`` invalidates only the process that
+        served it, so for up to the cache TTL another process lets a read of a deleted bank
+        through. The read then fails in the store rather than answering 404. This probe is
+        uncached, and runs only after a failure, so a successful read pays nothing for it.
+
+        When the bank is gone the stale entry is dropped, so later reads on this process 404
+        at the guard instead of failing in the store again. A probe that itself fails is
+        swallowed: the caller re-raises its original, more informative error.
+        """
+        from . import bank_info_cache
+
+        try:
+            backend = await self._get_backend()
+            exists = await bank_utils.bank_exists(backend, bank_id)
+        except Exception:
+            return
+        if exists:
+            return
+        await bank_info_cache.invalidate(bank_id)
+        from hindsight_api.extensions import OperationValidationError
+
+        raise OperationValidationError(f"Bank '{bank_id}' not found", status_code=404)
 
     async def _ensure_bank_exists(
         self,
